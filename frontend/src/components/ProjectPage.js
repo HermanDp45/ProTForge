@@ -5,6 +5,58 @@ import { MdArrowBack, MdDelete, MdSave, MdScience, MdUploadFile, MdVisibility } 
 import ThemeToggle from './ThemeToggle';
 import { projectApi, proteinApi } from '../utils/api';
 
+const hasMetricValue = (value) => value !== undefined && value !== null && value !== '';
+
+const metricValue = (value) => {
+  if (!hasMetricValue(value)) {
+    return '—';
+  }
+  if (Array.isArray(value)) {
+    return value.join(' × ');
+  }
+  return value;
+};
+
+const getCaDistanceSummary = (metrics) => {
+  const mean = metrics.ca_distance_mean;
+  const min = metrics.ca_distance_min;
+  const max = metrics.ca_distance_max;
+
+  if (hasMetricValue(mean) && hasMetricValue(min) && hasMetricValue(max)) {
+    return `${mean} Å (${min}-${max})`;
+  }
+
+  if (hasMetricValue(mean)) {
+    return mean;
+  }
+
+  return null;
+};
+
+const getStructureMetrics = (structure) => {
+  const metrics = structure?.metrics || {};
+  const sequence = String(structure?.fasta_sequence || '').trim();
+  const sequenceLength = sequence && sequence !== 'Sequence unavailable' ? sequence.length : null;
+  const caDistanceSummary = getCaDistanceSummary(metrics);
+  const rows = [
+    ['Длина', metrics.length ?? sequenceLength],
+    ['Атомы', metrics.atom_count],
+    ['Цепи', metrics.chain_count],
+    ['Время', metrics.generation_time],
+    ['Rg', metrics.radius_of_gyration],
+  ];
+
+  if (Number(metrics.backbone_break_count) > 0) {
+    rows.push(['Backbone breaks', metrics.backbone_break_count]);
+  }
+
+  if (caDistanceSummary) {
+    rows.push(['CA distance', caDistanceSummary]);
+  }
+
+  return rows.filter(([, value]) => hasMetricValue(value));
+};
+
 const ProjectPage = ({ theme, onToggleTheme }) => {
   const { projectId } = useParams();
   const navigate = useNavigate();
@@ -24,11 +76,8 @@ const ProjectPage = ({ theme, onToggleTheme }) => {
 
   const [generating, setGenerating] = useState(false);
   const [generationForm, setGenerationForm] = useState({
-    mode: 'generate',
+    name: '',
     length: 160,
-    quality: 0.8,
-    symmetry: 'none',
-    conditions: '',
   });
 
   const [uploading, setUploading] = useState(false);
@@ -90,16 +139,13 @@ const ProjectPage = ({ theme, onToggleTheme }) => {
     setNotice('');
     try {
       const payload = {
-        mode: generationForm.mode,
+        name: generationForm.name.trim(),
         length: Number(generationForm.length),
-        quality: Number(generationForm.quality),
-        symmetry: generationForm.symmetry,
-        conditions: generationForm.conditions,
       };
 
       const response = await proteinApi.generate(projectId, payload, true);
       if (response.status === 'queued') {
-        setNotice('Генерация запущена. Обнови список через пару секунд.');
+        setNotice('Генерация запущена. Обнови список через некоторое время.');
       } else {
         setNotice('Структура сгенерирована.');
       }
@@ -282,9 +328,9 @@ const ProjectPage = ({ theme, onToggleTheme }) => {
                   </p>
 
                   <div className="metric-list">
-                    <span>Realism: {structure?.metrics?.realism_score ?? '—'}</span>
-                    <span>pLDDT: {structure?.metrics?.pLDDT ?? '—'}</span>
-                    <span>scRMSD: {structure?.metrics?.sc_rmsd ?? '—'}</span>
+                    {getStructureMetrics(structure).map(([label, value]) => (
+                      <span key={label}>{label}: {metricValue(value)}</span>
+                    ))}
                   </div>
 
                   <div className="actions-row">
@@ -305,64 +351,28 @@ const ProjectPage = ({ theme, onToggleTheme }) => {
 
       {tab === 'generate' && (
         <section className="card animate-in">
-          <h2>Генерация / модификация белка</h2>
+          <h2>Генерация белка</h2>
           <form className="form-grid" onSubmit={handleGenerate}>
             <label>
-              Режим
-              <select
-                value={generationForm.mode}
-                onChange={(event) => setGenerationForm((prev) => ({ ...prev, mode: event.target.value }))}
-              >
-                <option value="generate">Сгенерировать новый</option>
-                <option value="modify">Модифицировать существующий</option>
-              </select>
+              Название структуры
+              <input
+                type="text"
+                value={generationForm.name}
+                onChange={(event) => setGenerationForm((prev) => ({ ...prev, name: event.target.value }))}
+                maxLength={100}
+                placeholder="Например: DiMA helix 160"
+              />
             </label>
 
             <label>
-              Длина последовательности (50-500)
+              Длина последовательности (50-254)
               <input
                 type="number"
                 min={50}
-                max={500}
+                max={254}
                 value={generationForm.length}
                 onChange={(event) => setGenerationForm((prev) => ({ ...prev, length: event.target.value }))}
                 required
-              />
-            </label>
-
-            <label>
-              Качество (0.1-1.0)
-              <input
-                type="number"
-                min={0.1}
-                max={1}
-                step={0.1}
-                value={generationForm.quality}
-                onChange={(event) => setGenerationForm((prev) => ({ ...prev, quality: event.target.value }))}
-                required
-              />
-            </label>
-
-            <label>
-              Симметрия
-              <select
-                value={generationForm.symmetry}
-                onChange={(event) => setGenerationForm((prev) => ({ ...prev, symmetry: event.target.value }))}
-              >
-                <option value="none">Нет</option>
-                <option value="cyclic">Cyclic</option>
-                <option value="dihedral">Dihedral</option>
-                <option value="tetrahedral">Tetrahedral</option>
-              </select>
-            </label>
-
-            <label>
-              Дополнительные условия
-              <textarea
-                rows={4}
-                placeholder="Например: устойчивость при pH 6.5, связывание лиганда..."
-                value={generationForm.conditions}
-                onChange={(event) => setGenerationForm((prev) => ({ ...prev, conditions: event.target.value }))}
               />
             </label>
 

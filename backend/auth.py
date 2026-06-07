@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
 import os
 from typing import Optional
 
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from . import crud
 from .database import get_db
 from .security import verify_password
+from .utils import utc_now
 
 SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "dev_secret_change_me")
 ALGORITHM = "HS256"
@@ -28,9 +29,9 @@ def authenticate_user(db: Session, username: str, password: str):
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = utc_now() + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        expire = utc_now() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt

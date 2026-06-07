@@ -1,64 +1,77 @@
 import os
-import time
-import uuid
-from datetime import datetime
-from pathlib import Path
 
 from celery import Celery
 
-from . import crud, schemas
+from . import crud
 from .database import SessionLocal
-from .utils import generate_mock_pdb
+from .services.protein_generation import create_generated_structure
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-AMINO_ACIDS = ["A", "C", "D", "E", "F", "G", "H", "I", "K", "L", "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y"]
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
 celery = Celery(__name__)
 celery.conf.update(
-    broker_url=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
-    result_backend=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
+    broker_url=REDIS_URL,
+    result_backend=REDIS_URL,
+
+    # Важно для GPU: не брать заранее пачку задач.
+    worker_prefetch_multiplier=1,
+
+    # Задача считается подтверждённой только после завершения.
+    task_acks_late=True,
+
+    # Если worker умер, задача вернётся в очередь.
+    task_reject_on_worker_lost=True,
+
+    # Чтобы долго висящие задачи не терялись Redis'ом.
+    broker_transport_options={
+        "visibility_timeout": 7200,
+    },
+    result_expires=7200,
 )
 
 
-@celery.task(name="generate_protein_async")
-def generate_protein_async(project_id: int, user_id: int, generation_params: dict):
+@celery.task(name="generate_protein_async", bind=True)
+def generate_protein_async(self, project_id: int, user_id: int, generation_params: dict):
     db = SessionLocal()
+
     try:
-        length = int(generation_params.get("length", 120))
-        quality = float(generation_params.get("quality", 0.8))
+        print("=== REAL DIMA CELERY TASK STARTED ===", flush=True)
+        print("project_id =", project_id, flush=True)
+        print("user_id =", user_id, flush=True)
+        print("generation_params =", generation_params, flush=True)
 
-        # Simulate long-running generation.
-        time.sleep(3)
+        project = crud.get_project_by_id(db, project_id)
+        if project is None or project.owner_id != user_id:
+            raise ValueError(
+                f"Project not found or forbidden: project_id={project_id}, user_id={user_id}"
+            )
 
-        pdb_content = generate_mock_pdb(length)
-        file_id = f"{uuid.uuid4()}.pdb"
-        storage_path = UPLOAD_DIR / file_id
-        storage_path.write_text(pdb_content, encoding="utf-8")
-
-        sequence = "".join(AMINO_ACIDS[i % len(AMINO_ACIDS)] for i in range(length))
-
-        metrics = {
-            "sc_rmsd": round(1.8 - 0.8 * quality, 3),
-            "pLDDT": round(70 + (quality * 25), 2),
-            "generation_time": f"{round(1.2 + (1.0 - quality) * 3, 2)}s",
-            "realism_score": round(0.55 + quality * 0.4, 3),
-            "completed_at": datetime.utcnow().isoformat(),
-        }
-
-        structure_data = schemas.ProteinStructureCreate(
-            name=f"Async_{uuid.uuid4().hex[:8]}",
-            pdb_file_path=f"/uploads/{file_id}",
-            fasta_sequence=sequence,
-            generation_params={**generation_params, "source": "generation"},
-            metrics=metrics,
+        structure = create_generated_structure(
+            db=db,
+            project_id=project_id,
+            generation_params=generation_params,
+            name_prefix="DiMA",
         )
 
-        crud.create_protein_structure(db, structure_data, project_id)
-        return {"status": "success", "project_id": project_id}
+        print("=== REAL DIMA CELERY TASK FINISHED ===", flush=True)
+        print("structure_id =", structure.id, flush=True)
+        print("pdb_file_path =", structure.pdb_file_path, flush=True)
+
+        return {
+            "status": "success",
+            "project_id": project_id,
+            "structure_id": structure.id,
+            "pdb_file_path": structure.pdb_file_path,
+            "name": structure.name,
+            "metrics": structure.metrics,
+        }
+
     except Exception as exc:
-        return {"status": "error", "message": str(exc)}
+        db.rollback()
+        print("=== REAL DIMA CELERY TASK FAILED ===", flush=True)
+        print(repr(exc), flush=True)
+        raise
+
     finally:
         db.close()

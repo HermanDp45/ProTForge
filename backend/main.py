@@ -1,7 +1,7 @@
 import json
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List
 
@@ -13,11 +13,13 @@ from sqlalchemy.orm import Session
 
 from . import auth, crud, models, schemas
 from .database import engine, get_db
-from .utils import generate_mock_pdb
+from .utils import compact_dict, ensure_utc_iso, extract_pdb_metrics, extract_sequence_from_pdb, utc_now_iso
+from .services.protein_generation import create_generated_structure
+from .config import UPLOAD_DIR
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+# UPLOAD_DIR = BASE_DIR / "uploads"
+# UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -38,30 +40,7 @@ app.add_middleware(
 
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
-
-AMINO_ACIDS = ["A", "C", "D", "E", "F", "G", "H", "I", "K", "L", "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y"]
-RESIDUE_TO_AA = {
-    "ALA": "A",
-    "ARG": "R",
-    "ASN": "N",
-    "ASP": "D",
-    "CYS": "C",
-    "GLN": "Q",
-    "GLU": "E",
-    "GLY": "G",
-    "HIS": "H",
-    "ILE": "I",
-    "LEU": "L",
-    "LYS": "K",
-    "MET": "M",
-    "PHE": "F",
-    "PRO": "P",
-    "SER": "S",
-    "THR": "T",
-    "TRP": "W",
-    "TYR": "Y",
-    "VAL": "V",
-}
+MAX_DIMA_LENGTH = 254
 
 
 @app.get("/")
@@ -171,23 +150,31 @@ def list_project_structures(
     _get_project_or_404(db, project_id, current_user.id)
     structures = crud.get_structures_by_project(db, project_id)
     for structure in structures:
+        _refresh_structure_metadata_from_pdb(db, structure)
         structure.pdb_file_path = _normalize_public_path(structure.pdb_file_path)
     return structures
 
 
 @app.post("/projects/{project_id}/generate-protein/", response_model=schemas.ProteinStructure)
-async def generate_protein(
+def generate_protein(
     project_id: int,
     params: str = Form(...),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
-    project = _get_project_or_404(db, project_id, current_user.id)
+    _get_project_or_404(db, project_id, current_user.id)
+
     generation_params = _parse_generation_params(params)
-    structure = _create_generated_structure(db, project.id, generation_params, name_prefix="Generated")
+
+    structure = create_generated_structure(
+        db=db,
+        project_id=project_id,
+        generation_params=generation_params,
+        name_prefix="DiMA",
+    )
+
     structure.pdb_file_path = _normalize_public_path(structure.pdb_file_path)
     return structure
-
 
 @app.post("/projects/{project_id}/generate-protein-async/", response_model=schemas.TaskResponse)
 async def generate_protein_async_endpoint(
@@ -208,12 +195,10 @@ async def generate_protein_async_endpoint(
         )
         return {"task_id": task.id, "status": "queued"}
     except Exception:
-        # Graceful fallback for local demo without Redis/Celery.
-        structure = _create_generated_structure(db, project_id, generation_params, name_prefix="GeneratedSync")
-        return {
-            "task_id": f"sync-{structure.id}",
-            "status": "completed",
-        }
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Async generation queue is unavailable. Start Redis/Celery or use the synchronous generation endpoint.",
+        )
 
 
 @app.get("/tasks/{task_id}", response_model=schemas.TaskStatusResponse)
@@ -266,20 +251,21 @@ async def upload_protein(
     storage_path.write_bytes(content)
 
     pdb_text = content.decode("utf-8", errors="ignore")
-    fasta_sequence = _extract_sequence_from_pdb(pdb_text)
+    fasta_sequence = extract_sequence_from_pdb(pdb_text)
+    pdb_metrics = extract_pdb_metrics(pdb_text)
+    uploaded_at = utc_now_iso()
 
     structure_data = schemas.ProteinStructureCreate(
         name=name.strip(),
         pdb_file_path=f"/uploads/{file_id}",
         fasta_sequence=fasta_sequence,
-        generation_params={"source": "upload", "uploaded_at": datetime.utcnow().isoformat()},
-        metrics={
-            "upload_time": datetime.utcnow().isoformat(),
-            "realism_score": 0.75,
-            "pLDDT": None,
-            "sc_rmsd": None,
-            "generation_time": "uploaded",
-        },
+        generation_params={"source": "upload", "uploaded_at": uploaded_at},
+        metrics=compact_dict({
+            "upload_time": uploaded_at,
+            "length": len(fasta_sequence) if fasta_sequence else None,
+            "source": "upload",
+            **pdb_metrics,
+        }),
     )
 
     structure = crud.create_protein_structure(db, structure_data, project_id)
@@ -294,6 +280,7 @@ def get_protein_structure(
     current_user: models.User = Depends(auth.get_current_user),
 ):
     structure = _get_structure_or_404(db, structure_id, current_user.id)
+    _refresh_structure_metadata_from_pdb(db, structure)
     structure.pdb_file_path = _normalize_public_path(structure.pdb_file_path)
     return structure
 
@@ -335,54 +322,29 @@ def _parse_generation_params(params: str) -> Dict[str, object]:
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON in generation params") from exc
 
-    length = int(payload.get("length", 120))
-    quality = float(payload.get("quality", 0.8))
-    mode = str(payload.get("mode", "generate"))
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Generation params must be a JSON object")
 
-    if length < 50 or length > 500:
-        raise HTTPException(status_code=400, detail="Protein length must be between 50 and 500")
-    if quality < 0.1 or quality > 1.0:
-        raise HTTPException(status_code=400, detail="Quality must be between 0.1 and 1.0")
+    try:
+        length = int(payload.get("length", 120))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Protein length must be a number") from exc
 
-    payload["length"] = length
-    payload["quality"] = round(quality, 2)
-    payload["mode"] = mode
-    payload.setdefault("created_at", datetime.utcnow().isoformat())
-    payload.setdefault("source", "generation")
-    return payload
+    raw_name = payload.get("name", "")
+    name = str(raw_name).strip() if raw_name is not None else ""
 
+    if length < 50 or length > MAX_DIMA_LENGTH:
+        raise HTTPException(status_code=400, detail=f"Protein length must be between 50 and {MAX_DIMA_LENGTH}")
+    if len(name) > 100:
+        raise HTTPException(status_code=400, detail="Structure name must be 100 characters or fewer")
 
-def _create_generated_structure(
-    db: Session,
-    project_id: int,
-    generation_params: Dict[str, object],
-    name_prefix: str,
-) -> models.ProteinStructure:
-    length = int(generation_params.get("length", 120))
-    quality = float(generation_params.get("quality", 0.8))
-
-    pdb_content = generate_mock_pdb(length)
-    file_id = f"{uuid.uuid4()}.pdb"
-    storage_path = UPLOAD_DIR / file_id
-    storage_path.write_text(pdb_content, encoding="utf-8")
-
-    sequence = "".join(AMINO_ACIDS[i % len(AMINO_ACIDS)] for i in range(length))
-
-    metrics = {
-        "sc_rmsd": round(1.8 - 0.8 * quality, 3),
-        "pLDDT": round(70 + (quality * 25), 2),
-        "generation_time": f"{round(1.2 + (1.0 - quality) * 3, 2)}s",
-        "realism_score": round(0.55 + quality * 0.4, 3),
+    clean_payload = {
+        "length": length,
+        "created_at": utc_now_iso(),
     }
-
-    structure_data = schemas.ProteinStructureCreate(
-        name=f"{name_prefix}_{uuid.uuid4().hex[:8]}",
-        pdb_file_path=f"/uploads/{file_id}",
-        fasta_sequence=sequence,
-        generation_params=generation_params,
-        metrics=metrics,
-    )
-    return crud.create_protein_structure(db, structure_data, project_id)
+    if name:
+        clean_payload["name"] = name
+    return clean_payload
 
 
 def _normalize_public_path(value: str) -> str:
@@ -414,22 +376,66 @@ def _delete_structure_file(path_value: str) -> None:
         return
 
 
-def _extract_sequence_from_pdb(pdb_text: str) -> str:
-    residues = []
-    seen_positions = set()
+def _refresh_structure_metadata_from_pdb(db: Session, structure: models.ProteinStructure) -> None:
+    metrics = dict(structure.metrics or {})
+    generation_params = dict(structure.generation_params or {})
+    changed = _normalize_timestamp_fields(generation_params, ("created_at", "uploaded_at"))
+    changed = _normalize_timestamp_fields(metrics, ("upload_time",)) or changed
 
-    for line in pdb_text.splitlines():
-        if not line.startswith("ATOM"):
-            continue
-        if len(line) < 27:
-            continue
-        residue = line[17:20].strip().upper()
-        chain = line[21:22]
-        position = line[22:26].strip()
-        key = (chain, position)
-        if key in seen_positions:
-            continue
-        seen_positions.add(key)
-        residues.append(RESIDUE_TO_AA.get(residue, "X"))
+    try:
+        storage_path = _resolve_storage_path(structure.pdb_file_path)
+        if not storage_path.exists():
+            if changed:
+                _save_structure_metadata(db, structure, metrics, generation_params)
+            return
+        pdb_text = storage_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        if changed:
+            _save_structure_metadata(db, structure, metrics, generation_params)
+        return
 
-    return "".join(residues) or "Sequence unavailable"
+    sequence = extract_sequence_from_pdb(pdb_text)
+    pdb_metrics = extract_pdb_metrics(pdb_text)
+
+    if sequence and not structure.fasta_sequence:
+        structure.fasta_sequence = sequence
+        changed = True
+
+    if sequence and not metrics.get("length"):
+        metrics["length"] = len(sequence)
+        changed = True
+
+    for key, value in pdb_metrics.items():
+        if value is None:
+            continue
+        if metrics.get(key) in (None, "", [], 0):
+            metrics[key] = value
+            changed = True
+
+    if changed:
+        _save_structure_metadata(db, structure, metrics, generation_params)
+
+
+def _normalize_timestamp_fields(payload: Dict[str, object], keys: tuple[str, ...]) -> bool:
+    changed = False
+    for key in keys:
+        if key not in payload:
+            continue
+        normalized = ensure_utc_iso(payload[key])
+        if normalized != payload[key]:
+            payload[key] = normalized
+            changed = True
+    return changed
+
+
+def _save_structure_metadata(
+    db: Session,
+    structure: models.ProteinStructure,
+    metrics: Dict[str, object],
+    generation_params: Dict[str, object],
+) -> None:
+    structure.metrics = compact_dict(metrics)
+    structure.generation_params = compact_dict(generation_params)
+    db.add(structure)
+    db.commit()
+    db.refresh(structure)

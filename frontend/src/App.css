@@ -634,6 +634,13 @@ textarea {
   color: var(--text-main);
 }
 
+.sequence-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
 .viewer-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 330px;

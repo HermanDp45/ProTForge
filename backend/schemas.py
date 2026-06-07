@@ -1,7 +1,13 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
+
+
+def _utc_iso(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
 
 
 class UserBase(BaseModel):
@@ -18,6 +24,10 @@ class User(UserBase):
 
     id: int
     created_at: datetime
+
+    @field_serializer("created_at", when_used="json")
+    def serialize_created_at(self, value: datetime) -> str:
+        return _utc_iso(value)
 
 
 class Token(BaseModel):
@@ -47,6 +57,10 @@ class Project(ProjectBase):
     created_at: datetime
     updated_at: datetime
 
+    @field_serializer("created_at", "updated_at", when_used="json")
+    def serialize_datetimes(self, value: datetime) -> str:
+        return _utc_iso(value)
+
 
 class ProteinStructureBase(BaseModel):
     name: str = Field(min_length=1, max_length=100)
@@ -66,6 +80,10 @@ class ProteinStructure(ProteinStructureBase):
     id: int
     project_id: int
     created_at: datetime
+
+    @field_serializer("created_at", when_used="json")
+    def serialize_created_at(self, value: datetime) -> str:
+        return _utc_iso(value)
 
 
 class MessageResponse(BaseModel):

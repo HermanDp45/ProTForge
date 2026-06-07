@@ -1,10 +1,87 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { MdArrowBack, MdDownload, MdScience } from 'react-icons/md';
+import { MdArrowBack, MdContentCopy, MdDownload, MdScience } from 'react-icons/md';
 
 import MolStarViewer from './MolStarViewer';
 import ThemeToggle from './ThemeToggle';
 import { API_BASE_URL, proteinApi } from '../utils/api';
+
+const hasValue = (value) => value !== undefined && value !== null && value !== '';
+
+const formatMetricValue = (value) => {
+  if (!hasValue(value)) {
+    return '—';
+  }
+  if (Array.isArray(value)) {
+    return value.join(' × ');
+  }
+  return value;
+};
+
+const wrapSequence = (sequence, width = 60) => {
+  const normalized = sequence.replace(/\s+/g, '');
+  const lines = [];
+
+  for (let index = 0; index < normalized.length; index += width) {
+    lines.push(normalized.slice(index, index + width));
+  }
+
+  return lines.join('\n');
+};
+
+const sanitizeFastaName = (value) => {
+  const name = String(value || 'structure').trim();
+  return name.replace(/\s+/g, '_');
+};
+
+const buildFasta = (structure) => {
+  const sequence = String(structure?.fasta_sequence || '').trim();
+  if (!sequence || sequence === 'Sequence unavailable') {
+    return '';
+  }
+
+  return `>${sanitizeFastaName(structure?.name)}|id=${structure?.id}\n${wrapSequence(sequence)}`;
+};
+
+const getMetricCards = (structure) => {
+  const metrics = structure?.metrics || {};
+  const sequence = String(structure?.fasta_sequence || '').trim();
+  const sequenceLength = sequence && sequence !== 'Sequence unavailable' ? sequence.length : null;
+
+  const rows = [
+    ['Длина', metrics.length ?? sequenceLength],
+    ['Атомы', metrics.atom_count],
+    ['Цепи', metrics.chain_count],
+    ['Время генерации', metrics.generation_time],
+    ['Radius of gyration', metrics.radius_of_gyration],
+  ];
+
+  if (Number(metrics.backbone_break_count) > 0) {
+    rows.push(['Backbone breaks', metrics.backbone_break_count]);
+  }
+
+  rows.push(
+    ['CA distance mean', metrics.ca_distance_mean],
+    ['CA distance min', metrics.ca_distance_min],
+    ['CA distance max', metrics.ca_distance_max],
+  );
+
+  return rows.filter(([, value]) => hasValue(value));
+};
+
+const getVisibleParams = (params = {}) => {
+  const allowedKeys = ['name', 'length', 'source', 'created_at', 'uploaded_at'];
+  return allowedKeys.reduce((result, key) => {
+    if (hasValue(params[key])) {
+      result[key] = params[key];
+    }
+    return result;
+  }, {});
+};
+
+const getDetailsTitle = (structure) => (
+  structure?.generation_params?.source === 'upload' ? 'Данные загрузки' : 'Параметры генерации'
+);
 
 const ProteinViewer = ({ theme, onToggleTheme }) => {
   const { structureId } = useParams();
@@ -13,6 +90,7 @@ const ProteinViewer = ({ theme, onToggleTheme }) => {
   const [structure, setStructure] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [copyNotice, setCopyNotice] = useState('');
 
   useEffect(() => {
     const loadStructure = async () => {
@@ -42,6 +120,37 @@ const ProteinViewer = ({ theme, onToggleTheme }) => {
 
     return `${API_BASE_URL}${structure.pdb_file_path}`;
   }, [structure]);
+
+  const fastaText = useMemo(() => buildFasta(structure), [structure]);
+  const metricCards = useMemo(() => getMetricCards(structure), [structure]);
+  const visibleParams = useMemo(() => getVisibleParams(structure?.generation_params), [structure]);
+
+  const handleCopyFasta = async () => {
+    if (!fastaText || !navigator?.clipboard) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(fastaText);
+      setCopyNotice('FASTA скопирована.');
+    } catch {
+      setCopyNotice('Не удалось скопировать FASTA.');
+    }
+  };
+
+  const handleDownloadFasta = () => {
+    if (!fastaText) {
+      return;
+    }
+
+    const blob = new Blob([fastaText], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${sanitizeFastaName(structure.name)}.fasta`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
 
   if (loading) {
     return (
@@ -86,6 +195,7 @@ const ProteinViewer = ({ theme, onToggleTheme }) => {
       </header>
 
       {error && <div className="alert alert-error">{error}</div>}
+      {copyNotice && <div className="alert alert-success">{copyNotice}</div>}
 
       <main className="viewer-layout">
         <section className="viewer-main-panel">
@@ -103,22 +213,12 @@ const ProteinViewer = ({ theme, onToggleTheme }) => {
           <section className="compact-panel">
             <h2>Характеристики</h2>
             <div className="metrics-grid">
-              <div>
-                <span>Realism</span>
-                <strong>{structure?.metrics?.realism_score ?? '—'}</strong>
-              </div>
-              <div>
-                <span>pLDDT</span>
-                <strong>{structure?.metrics?.pLDDT ?? '—'}</strong>
-              </div>
-              <div>
-                <span>scRMSD</span>
-                <strong>{structure?.metrics?.sc_rmsd ?? '—'}</strong>
-              </div>
-              <div>
-                <span>Время</span>
-                <strong>{structure?.metrics?.generation_time ?? '—'}</strong>
-              </div>
+              {metricCards.map(([label, value]) => (
+                <div key={label}>
+                  <span>{label}</span>
+                  <strong>{formatMetricValue(value)}</strong>
+                </div>
+              ))}
             </div>
           </section>
 
@@ -133,13 +233,27 @@ const ProteinViewer = ({ theme, onToggleTheme }) => {
       </main>
 
       <section className="card">
-        <h2>Последовательность (FASTA)</h2>
-        <pre className="sequence-box">{structure.fasta_sequence || 'Последовательность не найдена'}</pre>
+        <div className="section-header">
+          <h2>Последовательность (FASTA)</h2>
+          {fastaText && (
+            <div className="sequence-actions">
+              <button className="btn btn-secondary" type="button" onClick={handleCopyFasta}>
+                <MdContentCopy />
+                Копировать
+              </button>
+              <button className="btn btn-secondary" type="button" onClick={handleDownloadFasta}>
+                <MdDownload />
+                Скачать FASTA
+              </button>
+            </div>
+          )}
+        </div>
+        <pre className="sequence-box">{fastaText || 'Последовательность не найдена'}</pre>
       </section>
 
       <section className="card">
-        <h2>Параметры генерации</h2>
-        <pre className="sequence-box">{JSON.stringify(structure.generation_params || {}, null, 2)}</pre>
+        <h2>{getDetailsTitle(structure)}</h2>
+        <pre className="sequence-box">{JSON.stringify(visibleParams, null, 2)}</pre>
       </section>
     </div>
   );
